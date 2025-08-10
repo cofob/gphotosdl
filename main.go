@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -27,9 +26,9 @@ import (
 const (
 	program       = "gphotosdl"
 	gphotosURL    = "https://photos.google.com/"
-	loginURL      = "https://photos.google.com/login"
+	loginURL      = "https://accounts.google.com/"
 	gphotoURLReal = "https://photos.google.com/photo/"
-	gphotoURL     = "https://photos.google.com/lr/photo/" // redirects to gphotosURLReal which uses a different ID
+	gphotoURL     = "https://photos.google.com/photo/" // This is the base URL for a direct photo link
 	photoID       = "AF1QipNJVLe7d5mOh-b4CzFAob1UW-6EpFd0HnCBT3c6"
 )
 
@@ -44,15 +43,15 @@ var (
 
 // Global variables
 var (
-	configRoot    string      // top level config dir, typically ~/.config/gphotodl
-	browserConfig string      // work directory for browser instance
-	browserPath   string      // path to the browser binary
-	downloadDir   string      // temporary directory for downloads
-	browserPrefs  string      // JSON config for the browser
+	configRoot    string // top level config dir, typically ~/.config/gphotodl
+	browserConfig string // work directory for browser instance
+	browserPath   string // path to the browser binary
+	downloadDir   string // temporary directory for downloads
+	browserPrefs  string // JSON config for the browser
 	version       = "DEV"     // set by goreleaser
 	commit        = "NONE"    // set by goreleaser
 	date          = "UNKNOWN" // set by goreleaser
-	exitSignals   []os.Signal // Signals to exit on
+	exitSignals   []os.Signal // Signals to exit on (defined in OS-specific files)
 )
 
 // Remove the download directory and contents
@@ -120,7 +119,7 @@ func config() (err error) {
 	// Browser preferences
 	pref := map[string]any{
 		"download": map[string]any{
-			"default_directory": "/tmp/gphotos", // FIXME
+			"default_directory": downloadDir,
 		},
 	}
 	prefJSON, err := json.Marshal(pref)
@@ -196,7 +195,7 @@ func (g *Gphotos) startBrowser() error {
 		ControlURL(url).
 		NoDefaultDevice().
 		Trace(true).
-		SlowMotion(100 * time.Millisecond).
+		SlowMotion(100*time.Millisecond).
 		Logger(logger{})
 
 	err = g.browser.Connect()
@@ -236,7 +235,7 @@ func (g *Gphotos) startBrowser() error {
 		slog.Debug("Current URL", "url", info.URL)
 
 		// We are authenticated if we land on the main photos page.
-		if info.URL == gphotosURL {
+		if strings.HasPrefix(info.URL, gphotosURL) {
 			authenticated = true
 			slog.Info("Authentication successful.")
 			break
@@ -277,18 +276,15 @@ func (g *Gphotos) getRoot(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, `
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>`+program+`</title>
 </head>
-
 <body>
   <h1>`+program+`</h1>
   <p>`+program+` is used to download full resolution Google Photos in combination with rclone.</p>
 </body>
-
 </html>`)
 }
 
@@ -330,7 +326,6 @@ func (h httpError) Error() string {
 }
 
 // Download a photo with the ID given
-//
 // Returns the path to the photo which should be deleted after use
 func (g *Gphotos) Download(photoID string) (string, error) {
 	// Can only download one picture at once
@@ -347,26 +342,14 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 		return "", fmt.Errorf("failed to open browser tab for photo %q: %w", photoID, err)
 	}
 	defer func() {
-		err := page.Close()
-		if err != nil {
-			slog.Error("Error closing tab", "Error", err)
-		}
+		_ = page.Close()
 	}()
 
-	var netResponse *proto.NetworkResponseReceived
-
-	// Check the correct network request is received
-	waitNetwork := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
-		slog.Debug("network response", "rxURL", e.Response.URL, "status", e.Response.Status)
-		if strings.HasPrefix(e.Response.URL, gphotoURLReal) {
-			netResponse = e
-			return true
-		} else if strings.HasPrefix(e.Response.URL, gphotoURL) {
-			netResponse = e
-			return true
-		}
-		return false
-	})
+	// Download waiter
+	wait, err := page.WaitDownload()
+	if err != nil {
+		return "", fmt.Errorf("failed to set up download waiter: %w", err)
+	}
 
 	// Navigate to the photo URL
 	slog.Debug("Navigate to photo URL")
@@ -374,27 +357,11 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to navigate to photo %q: %w", photoID, err)
 	}
-	slog.Debug("Wait for page to load")
-	err = g.page.WaitLoad()
+
+	err = page.WaitLoad()
 	if err != nil {
 		return "", fmt.Errorf("gphoto page load: %w", err)
 	}
-
-	// Wait for the photos network request to happen
-	slog.Debug("Wait for network response")
-	waitNetwork()
-
-	if netResponse == nil {
-		return "", errors.New("did not receive the expected network response for the photo")
-	}
-	
-	// Print request headers
-	if netResponse.Response.Status != 200 {
-		return "", fmt.Errorf("gphoto fetch failed: %w", httpError(netResponse.Response.Status))
-	}
-
-	// Download waiter
-	wait := g.browser.WaitDownload(downloadDir)
 
 	// A short delay can help ensure the page is ready for key presses.
 	time.Sleep(time.Second)
@@ -407,8 +374,8 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 
 	// Wait for download
 	slog.Debug("Wait for download")
-	info := wait()
-	path := filepath.Join(downloadDir, info.GUID)
+	downloadEvent := wait()
+	path := filepath.Join(downloadDir, downloadEvent.GUID)
 
 	// Check file
 	fi, err := os.Stat(path)
@@ -438,10 +405,6 @@ func main() {
 		os.Exit(2)
 	}
 	defer removeDownloadDirectory()
-
-	// The logic for handling the -login flag is now integrated into New() and startBrowser().
-	// The application will now proceed directly to creating a browser instance,
-	// which will handle both the login flow and the authenticated headless flow.
 
 	g, err := New()
 	if err != nil {
