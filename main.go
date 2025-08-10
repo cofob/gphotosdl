@@ -36,7 +36,7 @@ const (
 // Flags
 var (
 	debug   = flag.Bool("debug", false, "set to see debug messages")
-	login   = flag.Bool("login", false, "set to launch login browser")
+	login   = flag.Bool("login", false, "set to launch a visible browser for login, then start the server")
 	show    = flag.Bool("show", false, "set to show the browser (not headless)")
 	addr    = flag.String("addr", "localhost:8282", "address for the web server")
 	useJSON = flag.Bool("json", false, "log in JSON format")
@@ -52,6 +52,7 @@ var (
 	version       = "DEV"     // set by goreleaser
 	commit        = "NONE"    // set by goreleaser
 	date          = "UNKNOWN" // set by goreleaser
+	exitSignals   []os.Signal // Signals to exit on
 )
 
 // Remove the download directory and contents
@@ -173,10 +174,13 @@ func New() (*Gphotos, error) {
 
 // start the browser off and check it is authenticated
 func (g *Gphotos) startBrowser() error {
+	// The -login flag implies showing the browser for the user to interact with.
+	isHeadless := !*show && !*login
+
 	// We use the default profile in our new data directory
 	l := launcher.New().
 		Bin(browserPath).
-		Headless(!*show).
+		Headless(isHeadless).
 		UserDataDir(browserConfig).
 		Preferences(browserPrefs).
 		Set("disable-gpu").
@@ -200,42 +204,59 @@ func (g *Gphotos) startBrowser() error {
 		return fmt.Errorf("failed to connect to browser: %w", err)
 	}
 
-	g.page, err = g.browser.Page(proto.TargetCreateTarget{URL: gphotosURL})
-	if err != nil {
-		return fmt.Errorf("couldn't open gphotos URL: %w", err)
+	// If -login is passed, start at the login URL. Otherwise, go to photos.
+	startURL := gphotosURL
+	if *login {
+		startURL = loginURL
 	}
 
-	eventCallback := func(e *proto.PageLifecycleEvent) {
-		slog.Debug("Event", "Name", e.Name, "Dump", e)
+	g.page, err = g.browser.Page(proto.TargetCreateTarget{URL: startURL})
+	if err != nil {
+		return fmt.Errorf("couldn't open initial URL: %w", err)
 	}
-	g.page.EachEvent(eventCallback)
 
 	err = g.page.WaitLoad()
 	if err != nil {
-		return fmt.Errorf("gphotos page load: %w", err)
+		return fmt.Errorf("initial page load: %w", err)
 	}
 
 	authenticated := false
-	for try := 0; try < 60; try++ {
+	if *login {
+		slog.Info("A browser window is open. Please log in to your Google account. The server will start automatically once login is complete.")
+	}
+
+	// Loop indefinitely if login flag is set (waiting for user), otherwise try for 60 seconds.
+	for try := 0; *login || try < 60; try++ {
 		time.Sleep(1 * time.Second)
-		info := g.page.MustInfo()
-		slog.Debug("URL", "url", info.URL)
-		// When not authenticated Google redirects away from the Photos URL
+		info, err := g.page.Info()
+		if err != nil {
+			slog.Warn("Could not get page info, retrying...", "err", err)
+			continue
+		}
+		slog.Debug("Current URL", "url", info.URL)
+
+		// We are authenticated if we land on the main photos page.
 		if info.URL == gphotosURL {
 			authenticated = true
-			slog.Debug("Authenticated")
+			slog.Info("Authentication successful.")
 			break
 		}
-		slog.Info("Please log in, or re-run with -login flag")
+
+		// Show this message only on the first try in non-login mode.
+		if try == 0 && !*login {
+			slog.Info("Not authenticated. Trying for 60 seconds. If this fails, re-run with the -login flag.")
+		}
 	}
+
 	if !authenticated {
-		return errors.New("browser is not log logged in - rerun with the -login flag")
+		return errors.New("browser is not logged in - rerun with the -login flag")
 	}
 	return nil
 }
 
 // start the web server off
 func (g *Gphotos) startServer() error {
+	slog.Info("Starting web server", "address", *addr)
 	http.HandleFunc("GET /", g.getRoot)
 	http.HandleFunc("GET /id/{photoID}", g.getID)
 	go func() {
@@ -261,7 +282,6 @@ func (g *Gphotos) getRoot(w http.ResponseWriter, r *http.Request) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>`+program+`</title>
-  <link rel="stylesheet" href="styles.css">
 </head>
 
 <body>
@@ -295,7 +315,7 @@ func (g *Gphotos) getID(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			slog.Debug("Removed downloaded photo", "id", photoID, "path", path)
 		} else {
-			slog.Error("Failed to remove download directory", "id", photoID, "path", path, "err", err)
+			slog.Error("Failed to remove downloaded photo", "id", photoID, "path", path, "err", err)
 		}
 	}()
 
@@ -321,7 +341,7 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 	slog := slog.With("id", photoID)
 
 	// Create a new blank browser tab
-	slog.Error("Open new tab")
+	slog.Debug("Open new tab")
 	page, err := g.browser.Page(proto.TargetCreateTarget{})
 	if err != nil {
 		return "", fmt.Errorf("failed to open browser tab for photo %q: %w", photoID, err)
@@ -364,6 +384,10 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 	slog.Debug("Wait for network response")
 	waitNetwork()
 
+	if netResponse == nil {
+		return "", errors.New("did not receive the expected network response for the photo")
+	}
+	
 	// Print request headers
 	if netResponse.Response.Status != 200 {
 		return "", fmt.Errorf("gphoto fetch failed: %w", httpError(netResponse.Response.Status))
@@ -372,11 +396,14 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 	// Download waiter
 	wait := g.browser.WaitDownload(downloadDir)
 
-	// Urg doesn't always catch the keypress so wait
+	// A short delay can help ensure the page is ready for key presses.
 	time.Sleep(time.Second)
 
 	// Shift-D to download
-	page.KeyActions().Press(input.ShiftLeft).Type('D').MustDo()
+	err = page.KeyActions().Press(input.ShiftLeft).Type('D').Do()
+	if err != nil {
+		return "", fmt.Errorf("failed to send download keypress: %w", err)
+	}
 
 	// Wait for download
 	slog.Debug("Wait for download")
@@ -386,7 +413,7 @@ func (g *Gphotos) Download(photoID string) (string, error) {
 	// Check file
 	fi, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("download failed: %w", err)
+		return "", fmt.Errorf("download failed, file not found: %w", err)
 	}
 
 	slog.Debug("Download successful", "size", fi.Size(), "path", path)
@@ -412,28 +439,13 @@ func main() {
 	}
 	defer removeDownloadDirectory()
 
-	// If login is required, run the browser standalone
-	if *login {
-		slog.Info("Log in to google with the browser that pops up, close it, then re-run this without the -login flag")
-		cmd := exec.Command(browserPath, "--user-data-dir="+browserConfig, loginURL)
-		err = cmd.Start()
-		if err != nil {
-			slog.Error("Failed to start browser", "err", err)
-			os.Exit(2)
-		}
-		slog.Info("Waiting for browser to be closed")
-		err = cmd.Wait()
-		if err != nil {
-			slog.Error("Browser run failed", "err", err)
-			os.Exit(2)
-		}
-		slog.Info("Now restart this program without -login")
-		os.Exit(1)
-	}
+	// The logic for handling the -login flag is now integrated into New() and startBrowser().
+	// The application will now proceed directly to creating a browser instance,
+	// which will handle both the login flow and the authenticated headless flow.
 
 	g, err := New()
 	if err != nil {
-		slog.Error("Failed to make browser", "err", err)
+		slog.Error("Failed to start application", "err", err)
 		os.Exit(2)
 	}
 	defer g.Close()
@@ -442,7 +454,7 @@ func main() {
 	signal.Notify(quit, exitSignals...)
 
 	// Wait for CTRL-C or SIGTERM
-	slog.Info("Press CTRL-C (or kill) to quit")
+	slog.Info("Server is running. Press CTRL-C (or kill) to quit.")
 	sig := <-quit
 	slog.Info("Signal received - shutting down", "signal", sig)
 }
